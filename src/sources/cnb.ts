@@ -157,7 +157,8 @@ const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOSt
   failures: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 export interface Retry { since: string; kind: 'issues' | 'pulls'; failedAt?: string; attempts?: number }
-const deleted = (error: unknown): boolean => error instanceof CliError && (error.code === 404 || error.code === 410)
+/** True when CNB returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
+const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
 
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<void> {
   const round = newRound(signal)

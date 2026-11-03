@@ -153,12 +153,38 @@ describe('Channels', () => {
   })
   it('posts a CNB review-thread reply when the channel carries reviewId', async () => {
     const commands = new Commands(() => cnbDeployment, {}, new AbortController().signal)
+    // List may omit the parent; still post the review reply (idempotency only).
     vi.spyOn(commands, 'cnbPages').mockResolvedValue([])
     const cnb = vi.spyOn(commands, 'cnb').mockResolvedValue({})
     const channel = cnbChannel('pulls', 8, undefined, { reviewId: '99', commentId: 'c1' })
     expect(await sendCnb({ commands }, { id: 'cnb-review', channel, text: 'Noted', kind: 'reply' })).toBe('sent')
     expect(cnb).toHaveBeenCalledWith(expect.anything(), 'pulls', 'post-pull-request-review-reply',
       expect.objectContaining({ number: 8, review_id: 99, reply_to_comment_id: 'c1' }))
+  })
+  it('falls back to a CNB PR comment when the review target is gone', async () => {
+    const commands = new Commands(() => cnbDeployment, {}, new AbortController().signal)
+    const pages = vi.spyOn(commands, 'cnbPages')
+      .mockRejectedValueOnce(new CliError('CNB HTTP 404', 404))
+      .mockResolvedValueOnce([])
+    const cnb = vi.spyOn(commands, 'cnb').mockResolvedValue({})
+    const channel = cnbChannel('pulls', 8, undefined, { reviewId: '99', commentId: 'c1' })
+    expect(await sendCnb({ commands }, { id: 'cnb-review-gone', channel, text: 'Noted', kind: 'reply' })).toBe('sent')
+    expect(pages).toHaveBeenCalledTimes(2)
+    expect(cnb).toHaveBeenCalledWith(expect.anything(), 'pulls', 'post-pull-comment',
+      expect.objectContaining({ number: 8, body: expect.stringContaining('Noted') }))
+  })
+  it('falls back to a CNB PR comment when post-review-reply answers 404', async () => {
+    const commands = new Commands(() => cnbDeployment, {}, new AbortController().signal)
+    vi.spyOn(commands, 'cnbPages').mockResolvedValueOnce([]).mockResolvedValueOnce([])
+    const cnb = vi.spyOn(commands, 'cnb')
+      .mockRejectedValueOnce(new CliError('CNB HTTP 404', 404))
+      .mockResolvedValueOnce({})
+    const channel = cnbChannel('pulls', 8, undefined, { reviewId: '99', commentId: 'c1' })
+    expect(await sendCnb({ commands }, { id: 'cnb-review-post-gone', channel, text: 'Noted', kind: 'reply' })).toBe('sent')
+    expect(cnb).toHaveBeenNthCalledWith(1, expect.anything(), 'pulls', 'post-pull-request-review-reply',
+      expect.objectContaining({ reply_to_comment_id: 'c1' }))
+    expect(cnb).toHaveBeenNthCalledWith(2, expect.anything(), 'pulls', 'post-pull-comment',
+      expect.objectContaining({ number: 8, body: expect.stringContaining('Noted') }))
   })
 })
 

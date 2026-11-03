@@ -34,7 +34,8 @@ const branchName = (ref: string): string => ref.replace(/^refs\/heads\//, '')
 export const agentPull = (pr: { author: { username: string }; head?: { repo?: { path?: string } | null } | null },
   deployment: Pick<Deployment, 'cnb' | 'repository'>): boolean =>
   !!deployment.cnb && sameName(pr.author.username, deployment.cnb.login)
-  && sameName(pr.head?.repo?.path ?? deployment.repository, deployment.repository)
+  // Fail closed when CNB omits head.repo (forks); matching GitHub's `?? ''`.
+  && sameName(pr.head?.repo?.path ?? '', deployment.repository)
 /** True when a branch belongs to the ticket: its last path segment is the ticket's short name. */
 export const ticketBranch = (ticket: Pick<Ticket, 'execution'>, ref: string): boolean =>
   !!ticket.execution?.name && branchName(ref).split('/').at(-1) === ticket.execution.name

@@ -10,6 +10,7 @@ import { cnbAddress, cnbPage, CommentSchema, type CnbKind } from './cnb-trigger.
 /** True when a thread is permanently gone (410) or locked (403); 404 is retried because it can mean temporary permission loss. */
 const gone = (error: unknown): boolean => error instanceof CliError
   && (error.code === 410 || (error.code === 403 && /lock/i.test(error.message)))
+const missing = (error: unknown): boolean => error instanceof CliError && (error.code === 404 || error.code === 410)
 /** Posts a comment or review reply with an embedded HTML marker so retries do not create duplicate comments. */
 export async function sendCnb(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const { commands } = host
@@ -24,15 +25,20 @@ export async function sendCnb(host: Pick<SourceContext, 'commands'>, message: Ou
     const reviewId = message.channel.address.reviewId
     const replyTo = address?.comment ?? message.channel.address.commentId
     if (kind === 'pulls' && reviewId && replyTo) {
-      const listed = await commands.cnbPages(CommentSchema, 'pulls', 'list-pull-review-comments',
-        { number, review_id: Number(reviewId) })
-      const mine = listed.some(comment => sameName(comment.author.username, cnb.login)
-        && String(comment.reply_to_comment_id ?? '') === String(replyTo) && (comment.body ?? '').includes(marker))
-      if (mine) return 'sent'
-      await commands.cnb(z.unknown(), 'pulls', 'post-pull-request-review-reply', {
-        number, review_id: Number(reviewId), reply_to_comment_id: String(replyTo), body: `${message.text}\n\n${marker}`,
-      })
-      return 'sent'
+      // Always try the review reply; fall back to a top-level PR comment only when the target is gone (404/410).
+      try {
+        const listed = await commands.cnbPages(CommentSchema, 'pulls', 'list-pull-review-comments',
+          { number, review_id: Number(reviewId) })
+        const mine = listed.some(comment => sameName(comment.author.username, cnb.login)
+          && String(comment.reply_to_comment_id ?? '') === String(replyTo) && (comment.body ?? '').includes(marker))
+        if (mine) return 'sent'
+        await commands.cnb(z.unknown(), 'pulls', 'post-pull-request-review-reply', {
+          number, review_id: Number(reviewId), reply_to_comment_id: String(replyTo), body: `${message.text}\n\n${marker}`,
+        })
+        return 'sent'
+      } catch (error) {
+        if (!missing(error)) throw error
+      }
     }
     const module = kind === 'pulls' ? 'pulls' : 'issues'
     const listTool = kind === 'pulls' ? 'list-pull-comments' : 'list-issue-comments'

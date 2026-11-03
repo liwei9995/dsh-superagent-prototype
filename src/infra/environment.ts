@@ -103,8 +103,9 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
   const forgeCli = deployment.forge === 'cnb' ? 'cnb' : 'gh'
-  if (deployment.forge === 'cnb') await shim('cnb', run(agent.cli))
-  else await shim('gh', run(agent.cli))
+  // Active forge runs the agent CLI; the inactive one fail-shims so PATH cannot reach a host `gh`/`cnb` with other credentials.
+  await shim('gh', deployment.forge === 'github' ? run(agent.cli) : fail('gh is unavailable: this installation uses CNB, not GitHub.'))
+  await shim('cnb', deployment.forge === 'cnb' ? run(agent.cli) : fail('cnb is unavailable: this installation uses GitHub, not CNB.'))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
     await shim(name, fail(`${name} is blocked in this installation; use ${forgeCli}, which acts as ${agent.login}.`))

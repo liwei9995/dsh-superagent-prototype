@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
+import { GIT_LOCATION, agentVariables, cnbCredentialHelper, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -38,6 +38,21 @@ describe('worker shims', () => {
     await expect(exec(join(bin, 'lark-cli'), ['im', '+chat-list'])).rejects.toMatchObject({ code: 1, stderr: 'lark-cli is unavailable: this installation has no Feishu bot.\n' })
     await expect(exec(join(bin, 'personal-gh'), [])).rejects.toMatchObject({ code: 1, stderr: 'personal-gh is blocked in this installation; use gh, which acts as agent-bot.\n' })
   })
+  it('fail-shims the inactive forge CLI so workers cannot reach a host binary with other credentials', async () => {
+    await writeEnvironment(testDeployment({ stateDir: dir, feishu: undefined }), [])
+    await expect(exec(join(workerBin(dir), 'cnb'), ['users', 'get-user-info'])).rejects.toMatchObject({
+      code: 1, stderr: 'cnb is unavailable: this installation uses GitHub, not CNB.\n',
+    })
+    const cnb = program(join(dir, 'cnb-agent'), 'echo cnb "$@"')
+    await writeEnvironment(testDeployment({
+      stateDir: dir, forge: 'cnb', github: undefined, feishu: undefined,
+      cnb: { cli: cnb, login: 'agent-bot', noreply: 'a@noreply.cnb.cool' },
+    }), [])
+    expect((await exec(join(workerBin(dir), 'cnb'), ['pulls', 'list-pulls'])).stdout).toBe('cnb pulls list-pulls\n')
+    await expect(exec(join(workerBin(dir), 'gh'), ['api', 'user'])).rejects.toMatchObject({
+      code: 1, stderr: 'gh is unavailable: this installation uses CNB, not GitHub.\n',
+    })
+  })
   it('keep `gh` and `lark-cli` working, and shim no `git`, when the blocked commands name the commands workers need', async () => {
     const gh = program(join(dir, 'gh-agent'), 'echo gh "$@"'), lark = program(join(dir, 'lark-bot'), 'echo lark "$@"')
     const base = testDeployment()
@@ -49,7 +64,7 @@ describe('worker shims', () => {
   it('replace only what dsh-superagent wrote and refuse anything else in its places', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli'])
     await writeEnvironment(testDeployment({ stateDir: dir }), [])
-    expect(readdirSync(workerBin(dir)).sort()).toEqual(['gh', 'lark-cli'])
+    expect(readdirSync(workerBin(dir)).sort()).toEqual(['cnb', 'gh', 'lark-cli'])
     // A file that merely contains the marker on a later line, a symlink to a shim, and a foreign gitconfig are all rejected.
     writeFileSync(join(workerBin(dir), 'notes'), `notes\nmore\n${readFileSync(join(workerBin(dir), 'gh'), 'utf8').split('\n')[1]}\n`)
     await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow(`${join(workerBin(dir), 'notes')} was not written by dsh-superagent`)
@@ -66,8 +81,19 @@ describe('worker shims', () => {
     const legacy = (file: string, name: string) => writeFileSync(file, readFileSync(file, 'utf8').replace('Written by dsh-superagent', `Written by ${name}`))
     legacy(join(workerBin(dir), 'old-cli'), 'dsh-tag'); legacy(join(workerBin(dir), 'older-cli'), 'dsh-freelancer'); legacy(workerGitConfig(dir), 'dsh-go')
     await writeEnvironment(testDeployment({ stateDir: dir }), [])
-    expect(readdirSync(workerBin(dir)).sort()).toEqual(['gh', 'lark-cli'])
+    expect(readdirSync(workerBin(dir)).sort()).toEqual(['cnb', 'gh', 'lark-cli'])
     expect(readFileSync(workerGitConfig(dir), 'utf8')).toContain('Written by dsh-superagent')
+  })
+  it('writes the CNB credential helper into worker gitconfig', async () => {
+    const cnb = program(join(dir, 'cnb-agent'), 'exit 0')
+    await writeEnvironment(testDeployment({
+      stateDir: dir, forge: 'cnb', github: undefined, feishu: undefined,
+      cnb: { cli: cnb, login: 'agent-bot', noreply: 'a@noreply.cnb.cool' },
+    }), [])
+    const config = readFileSync(workerGitConfig(dir), 'utf8')
+    expect(config).toContain(`[credential "https://cnb.cool"]\n\thelper = "${cnbCredentialHelper(cnb)}"`)
+    expect(config).toContain('[url "https://cnb.cool/"]')
+    expect(config).not.toContain('github.com')
   })
 })
 

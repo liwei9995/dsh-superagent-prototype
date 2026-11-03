@@ -57,5 +57,8 @@ describe('cnb triggers', () => {
     expect(agentPull(pr, deployment)).toBe(true)
     expect(agentPull({ ...pr, head: { ...pr.head, repo: { path: 'other/fork' } } }, deployment)).toBe(false)
     expect(agentPull({ ...pr, author: { username: 'alice' } }, deployment)).toBe(false)
+    // Missing head.repo must not fall open to the deployment repository (forks omit it).
+    expect(agentPull({ ...pr, head: { ...pr.head, repo: null } }, deployment)).toBe(false)
+    expect(agentPull({ ...pr, head: { sha: 'abc', ref: 'refs/heads/agent/fix-margin' } }, deployment)).toBe(false)
   })
 })
