@@ -3,6 +3,9 @@ import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
+import { cnbKind } from '../src/sources/cnb.ts'
+import { sendCnb } from '../src/sources/cnb-channel.ts'
+import { cnbChannel } from '../src/sources/cnb-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { githubChannel } from '../src/sources/github-trigger.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
@@ -10,9 +13,12 @@ import { SettingsSchema } from '../src/policy.ts'
 import { key, type OutboundMessage } from '../src/core/index.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
-sources.register(feishuKind); sources.register(githubKind)
+sources.register(feishuKind); sources.register(githubKind); sources.register(cnbKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
-const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
+const deployment = testDeployment({ github: { ...testDeployment().github!, cli: '/path/agent-gh' } })
+const cnbDeployment = testDeployment({
+  forge: 'cnb', github: undefined, cnb: { cli: '/path/agent-cnb', login: 'agent-bot', noreply: 'a@noreply.cnb.cool' },
+})
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
 describe('account-isolated operations', () => {
@@ -124,6 +130,35 @@ describe('Channels', () => {
     const message = feishuChannel('oc_1', 'om_1').address
     expect(feishuKind.channel!.link(message, links)).toEqual({ url: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_1',
       label: { zh: '飞书消息', en: 'Feishu message' }, triggerId: key('feishu', 'om_1') })
+  })
+  it('locks CNB calls to the configured repository even when flags name another repo', async () => {
+    const commands = new Commands(() => cnbDeployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('{"status":200,"data":[]}')
+    await commands.cnb(z.array(z.unknown()), 'issues', 'list-issues', { repo: 'evil/other', page: 1 })
+    expect(run).toHaveBeenCalledWith('/path/agent-cnb', expect.arrayContaining(['--repo', 'acme/widgets']))
+    expect(run.mock.calls[0]![1]).not.toContain('evil/other')
+  })
+  it('drops a CNB reply only when the thread is gone or locked, and retries 404', async () => {
+    const commands = new Commands(() => cnbDeployment, {}, new AbortController().signal)
+    const host = { commands }
+    vi.spyOn(commands, 'cnbPages').mockResolvedValue([])
+    const cnb = vi.spyOn(commands, 'cnb')
+    const message = { id: 'cnb-op', channel: cnbChannel('issues', 3), text: 'Done', kind: 'reply' as const }
+    cnb.mockRejectedValueOnce(new CliError('CNB HTTP 410', 410))
+    expect(await sendCnb(host, message)).toBe('gone')
+    cnb.mockRejectedValueOnce(new CliError('issue is locked', 403))
+    expect(await sendCnb(host, message)).toBe('gone')
+    cnb.mockRejectedValueOnce(new CliError('CNB HTTP 404', 404))
+    await expect(sendCnb(host, message)).rejects.toMatchObject({ code: 404 })
+  })
+  it('posts a CNB review-thread reply when the channel carries reviewId', async () => {
+    const commands = new Commands(() => cnbDeployment, {}, new AbortController().signal)
+    vi.spyOn(commands, 'cnbPages').mockResolvedValue([])
+    const cnb = vi.spyOn(commands, 'cnb').mockResolvedValue({})
+    const channel = cnbChannel('pulls', 8, undefined, { reviewId: '99', commentId: 'c1' })
+    expect(await sendCnb({ commands }, { id: 'cnb-review', channel, text: 'Noted', kind: 'reply' })).toBe('sent')
+    expect(cnb).toHaveBeenCalledWith(expect.anything(), 'pulls', 'post-pull-request-review-reply',
+      expect.objectContaining({ number: 8, review_id: 99, reply_to_comment_id: 'c1' }))
   })
 })
 

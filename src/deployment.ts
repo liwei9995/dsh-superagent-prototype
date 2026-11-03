@@ -29,7 +29,8 @@ export interface Machine {
   admissionContextTimeoutMs: Volatile<number>
 }
 const MOVED: Record<string, string> = {
-  repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
+  repository: 'on the GitHub or CNB Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
+  cnb: 'on the CNB Source',
   feishu: 'on the Feishu Source', author: 'prompt text', repositoryPath: 'in the prepare command of the Execution settings',
   worktreeRoot: 'the ticket directory of the Execution settings', blockedCommands: 'in the Execution settings',
 }
@@ -46,16 +47,33 @@ export const GithubAccountsSchema = z.object({
   repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
   cli: z.string().trim().default(''),
 })
+/** CNB repository paths may be nested (`org/repo` or `org/group/repo`). */
+export const CnbAccountsSchema = z.object({
+  repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)+)?$/, 'group/repo').default(''),
+  cli: z.string().trim().default(''),
+})
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  github: Object.keys(GithubAccountsSchema.shape), cnb: Object.keys(CnbAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape),
+}
 
+export type Forge = 'github' | 'cnb'
+export interface AgentAccount { cli: string; login: string; noreply: string }
 export interface Deployment extends Machine {
   repository: string
-  github: { cli: string; login: string; noreply: string }
+  forge: Forge
+  github?: AgentAccount
+  cnb?: AgentAccount
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
+/** The agent account of the active forge (GitHub or CNB). */
+export function forgeAccount(deployment: Pick<Deployment, 'forge' | 'github' | 'cnb'>): AgentAccount {
+  const account = deployment.forge === 'cnb' ? deployment.cnb : deployment.github
+  if (!account?.cli || !account.login) throw new Error(`The ${deployment.forge} agent account is not configured`)
+  return account
+}
 
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
 export function executable(name: string, path: string, exclude?: string): string {
@@ -77,16 +95,41 @@ export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd
 
 const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.number().int().positive() })
 const RepositoryAccess = z.object({ name: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/), push: z.boolean().nullable() })
+const CnbUser = z.object({ username: z.string().min(1), email: z.string().optional() })
+const CnbRepo = z.object({ path: z.string().min(1) })
+const CnbAccess = z.object({
+  access_level: z.enum(['Unknown', 'Guest', 'Reporter', 'Developer', 'Master', 'Owner']).optional(),
+  write_privilege: z.boolean().optional(),
+})
+const CNB_PUSH = new Set(['Developer', 'Master', 'Owner'])
 function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   let value: unknown
   try { value = JSON.parse(text) } catch { return undefined /* Non-JSON output; the caller surfaces the setup failure. */ }
   const result = schema.safeParse(value)
   return result.success ? result.data : undefined
 }
+/** Parse `cnb … -v` JSON (`{ status, data }`) or a bare JSON payload. */
+function cnbData<T>(schema: z.ZodType<T>, text: string): T | undefined {
+  let value: unknown
+  try { value = JSON.parse(text) } catch { return undefined }
+  const envelope = z.object({ status: z.number().optional(), data: z.unknown() }).safeParse(value)
+  return parsed(schema, JSON.stringify(envelope.success ? envelope.data.data : value))
+}
+/**
+ * Resolve the coding forge from Source settings: GitHub when its repository is set, otherwise CNB.
+ * Naming both repositories is refused so git credentials and PR binding stay unambiguous.
+ */
+export async function resolveDeployment(machine: Machine, github: unknown, cnb: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  const gh = GithubAccountsSchema.parse(github ?? {})
+  const cn = CnbAccountsSchema.parse(cnb ?? {})
+  if (gh.repository && cn.repository) throw new SetupError('bothForges')
+  if (gh.repository) return resolveGithub(machine, gh, probe, path)
+  if (cn.repository) return resolveCnb(machine, cn, probe, path)
+  throw new SetupError('repositoryUnset')
+}
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+export async function resolveGithub(machine: Machine, accounts: z.infer<typeof GithubAccountsSchema>, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
   const { stateDir } = machine
-  const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
   if (!remote) throw new SetupError('repositoryUnset')
   if (!accounts.cli) throw new SetupError('agentCliUnset')
@@ -102,7 +145,38 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  return { ...machine, repository, forge: 'github', github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+}
+/** Verify the agent's CNB CLI identity and Developer+ access to the configured repository. */
+export async function resolveCnb(machine: Machine, accounts: z.infer<typeof CnbAccountsSchema>, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  const { stateDir } = machine
+  const remote = accounts.repository
+  if (!remote) throw new SetupError('cnbRepositoryUnset')
+  if (!accounts.cli) throw new SetupError('cnbCliUnset')
+  let cli: string
+  try { cli = executable(accounts.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('cnbCliMissing', { output: reason(error) }) }
+  const userText = await probe([cli, 'users', 'get-user-info', '-v']).catch((error: unknown) => {
+    throw new SetupError('cnbCliSignedOut', { output: reason(error) })
+  })
+  const agent = cnbData(CnbUser, userText)
+  if (!agent) throw new SetupError('cnbCliNoAccount')
+  const repoText = await probe([cli, 'repositories', 'get-by-id', '--repo', remote, '-v']).catch((error: unknown) => {
+    throw new SetupError('cnbRepositoryUnreadable', { account: agent.username, repository: remote, output: reason(error) })
+  })
+  const repo = cnbData(CnbRepo, repoText)
+  if (!repo) throw new SetupError('cnbRepositoryUnreported', { repository: remote })
+  const repository = repo.path
+  // `repositories get-by-id` often reports access Unknown; the members access-level probe is authoritative for push.
+  const levelText = await probe([cli, 'members', 'get-member-access-level-of-repo', '--repo', repository, '-v']).catch((error: unknown) => {
+    throw new SetupError('cnbRepositoryUnreadable', { account: agent.username, repository, output: reason(error) })
+  })
+  const level = cnbData(CnbAccess, levelText)
+  if (!level) throw new SetupError('cnbRepositoryUnreported', { repository })
+  if (level.write_privilege !== true && !CNB_PUSH.has(level.access_level ?? 'Unknown')) {
+    throw new SetupError('cnbRepositoryReadOnly', { account: agent.username, repository })
+  }
+  const noreply = agent.email?.includes('@noreply.cnb.cool') ? agent.email : `${agent.username}@noreply.cnb.cool`
+  return { ...machine, repository, forge: 'cnb', cnb: { cli, login: agent.username, noreply } }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

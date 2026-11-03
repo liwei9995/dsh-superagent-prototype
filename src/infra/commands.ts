@@ -1,4 +1,4 @@
-/** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
+/** Subprocess wrapper for running gh, cnb, lark-cli, and git commands under the deployment's configured accounts. */
 import { execFile } from 'node:child_process'
 import { basename } from 'node:path'
 import { promisify } from 'node:util'
@@ -53,7 +53,7 @@ function membership(error: unknown): unknown {
   return new CliError(hint, error.code, error.exitCode)
 }
 /**
- * Executes gh, lark-cli, and git subprocesses with deployment account credentials, timeouts, and abort signals.
+ * Executes gh, cnb, lark-cli, and git subprocesses with deployment account credentials, timeouts, and abort signals.
  * Restricts GitHub API calls to the configured repository and translates CLI failures into CliError instances for Sources, MasterAssessor, Outbox, and Settings.
  */
 export class Commands {
@@ -72,8 +72,18 @@ export class Commands {
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
+  private githubCli(): string {
+    const cli = this.deployment.github?.cli
+    if (!cli) throw new Error('The GitHub CLI is unavailable on this CNB deployment')
+    return cli
+  }
+  private cnbCli(): string {
+    const cli = this.deployment.cnb?.cli
+    if (!cli) throw new Error('The CNB CLI is unavailable on this GitHub deployment')
+    return cli
+  }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.githubCli(), args)) as T }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,7 +92,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(this.githubCli(), ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
@@ -95,6 +105,44 @@ export class Commands {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
     if (outside) throw new Error('GitHub calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
+  }
+  /**
+   * Runs a CNB CLI module tool with `-v` (raw JSON), restricted to the configured repository when `repo` is omitted from flags.
+   * @throws CliError with CNB's HTTP status as `code` on failure.
+   */
+  async cnb<T>(schema: z.ZodType<T>, module: string, tool: string, flags: Record<string, string | number | boolean | undefined> = {}): Promise<T> {
+    const args = [module, tool, '-v']
+    // `repo` last so callers cannot override the configured repository sandbox.
+    const withRepo: Record<string, string | number | boolean | undefined> = { ...flags, repo: this.repository }
+    for (const [key, value] of Object.entries(withRepo)) {
+      if (value === undefined || value === false) continue
+      const flag = `--${key.replaceAll('_', '-')}`
+      if (value === true) args.push(flag)
+      else args.push(flag, String(value))
+    }
+    const raw = await this.run(this.cnbCli(), args)
+    let envelope: { status?: number; data?: unknown; message?: string }
+    try { envelope = JSON.parse(raw) as typeof envelope }
+    catch { throw new CliError('CNB CLI returned non-JSON output') }
+    const status = envelope.status ?? 0
+    if (status >= 400) throw new CliError(typeof envelope.data === 'object' && envelope.data && 'errmsg' in envelope.data
+      ? String((envelope.data as { errmsg?: string }).errmsg ?? `CNB HTTP ${status}`)
+      : `CNB HTTP ${status}`, status)
+    return schema.parse(envelope.data)
+  }
+  /** Fetches every page of a CNB list tool, skipping items that fail schema validation. */
+  async cnbPages<T>(item: z.ZodType<T>, module: string, tool: string, flags: Record<string, string | number | boolean | undefined> = {}, tally?: Tally): Promise<T[]> {
+    const items: unknown[] = []
+    let page = 1
+    for (;;) {
+      const body = await this.cnb(z.unknown(), module, tool, { ...flags, page, page_size: 100 })
+      const listed = Array.isArray(body) ? body : []
+      items.push(...listed)
+      if (listed.length < 100) break
+      page += 1
+      if (page > 100) break // ponytail: hard stop; upgrade if a CNB list regularly exceeds 10k items
+    }
+    return validItems(item, items, tally)
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

@@ -52,24 +52,45 @@ describe('configuration schema', () => {
   })
   it('names keys the configuration does not define, and where the values of older keys live now', () => {
     const raw = minimal({ repository: 'acme/widgets', repositoryPath: '/srv/widgets', blockedCommands: [], author: { name: 'Alice' }, extra: 1 })
-    expect(() => machineOf(Config(raw))).toThrow('keys it does not use: repository (now on the GitHub Source), repositoryPath (now in the prepare command of the Execution settings), blockedCommands (now in the Execution settings), author (now prompt text), extra;')
+    expect(() => machineOf(Config(raw))).toThrow('keys it does not use: repository (now on the GitHub or CNB Source), repositoryPath (now in the prepare command of the Execution settings), blockedCommands (now in the Execution settings), author (now prompt text), extra;')
   })
 })
 
 describe('setup', () => {
   it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
-    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
-    expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
+    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, {}, probe, path)
+    expect(deployment).toMatchObject({ repository: 'acme/widgets', forge: 'github', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
     expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
     expect(deployment).not.toHaveProperty('feishu')
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
-    expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
+    expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, {}, probe, path)).repository).toBe('acme/widgets')
+  })
+  it('reads the repository from the CNB Source when GitHub is unset', async () => {
+    program(join(dir, 'bin', 'cnb'), `case "$*" in
+  "users get-user-info -v") echo '{"status":200,"data":{"username":"agent-bot","email":"agent-bot@noreply.cnb.cool"}}' ;;
+  "repositories get-by-id --repo acme/widgets -v") echo '{"status":200,"data":{"path":"acme/widgets","access":"Unknown"}}' ;;
+  "members get-member-access-level-of-repo --repo acme/widgets -v") echo '{"status":200,"data":{"access_level":"Owner","write_privilege":true}}' ;;
+  *) exit 1 ;;
+esac`)
+    const deployment = await resolveDeployment(machine(), {}, { repository: 'acme/widgets', cli: 'cnb' }, probe, path)
+    expect(deployment).toMatchObject({ repository: 'acme/widgets', forge: 'cnb', cnb: { cli: join(dir, 'bin', 'cnb'), login: 'agent-bot' } })
+  })
+  it('refuses a CNB repository the agent cannot push to, even when get-by-id reports Unknown access', async () => {
+    program(join(dir, 'bin', 'cnb'), `case "$*" in
+  "users get-user-info -v") echo '{"status":200,"data":{"username":"agent-bot"}}' ;;
+  "repositories get-by-id --repo acme/widgets -v") echo '{"status":200,"data":{"path":"acme/widgets","access":"Unknown"}}' ;;
+  "members get-member-access-level-of-repo --repo acme/widgets -v") echo '{"status":200,"data":{"access_level":"Guest","write_privilege":false}}' ;;
+  *) exit 1 ;;
+esac`)
+    await expect(resolveDeployment(machine(), {}, { repository: 'acme/widgets', cli: 'cnb' }, probe, path))
+      .rejects.toEqual(setupError('cnb', 'cnbRepositoryReadOnly', { account: 'agent-bot', repository: 'acme/widgets' }))
   })
   it('names what setup needs and where it is set', async () => {
-    const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>
-      expect(resolveDeployment(machine(), github, probe, path)).rejects.toEqual(setupError(place, code, values))
+    const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown, cnb: unknown = {}) =>
+      expect(resolveDeployment(machine(), github, cnb, probe, path)).rejects.toEqual(setupError(place, code, values))
     const repository = 'acme/widgets'
     await needs('github', 'repositoryUnset', {}, { cli: 'gh' })
+    await needs('deployment', 'bothForges', {}, { repository, cli: 'gh' }, { repository, cli: 'cnb' })
     await needs('github', 'agentCliUnset', {}, { repository })
     await needs('github', 'agentCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }, { repository, cli: join(dir, 'missing') })
     await needs('github', 'agentCliMissing', { output: 'bin/gh must be a command name or an absolute path' }, { repository, cli: 'bin/gh' })
