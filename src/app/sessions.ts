@@ -60,6 +60,20 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+/** MCP server namespaces workers may use (`mcp__<server>__…`). Keep this list short: each server expands the unattended tool surface. */
+const WORK_MCP_SERVERS = ['sentry'] as const
+/** True when a registered tool is an allowed worker MCP tool (`mcp__sentry__…`). */
+export const workerMcpTool = (name: string): boolean =>
+  WORK_MCP_SERVERS.some(server => name.startsWith(`mcp__${server}__`))
+/** Collect already-registered MCP tools for `WORK_MCP_SERVERS` that `restrict({ allow })` can name. */
+function registeredWorkerMcp(tools: { get(name: string, scope?: object): unknown; view?(scope?: object): { restrictableNames: Set<string> } },
+  scope: object | undefined): string[] {
+  // ponytail: `view` is not on the public ToolRuntime types; it is the only way to list restrictable names. If a DSH build
+  // drops it, workers simply keep the fixed WORK_TOOLS set (Sentry MCP stays unavailable until this is updated).
+  const names = tools.view?.(scope)?.restrictableNames ?? tools.view?.()?.restrictableNames
+  if (!names) return []
+  return [...names].filter(name => workerMcpTool(name) && tools.get(name, scope))
+}
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -289,8 +303,9 @@ export class Sessions {
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
     const parent = scopeParentOf(agent)
-    const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    const tools = agent.ctx.tools
+    const allow = [...WORK_TOOLS.filter(name => tools.get(name, parent)), ...registeredWorkerMcp(tools, parent)]
+    return [tools.restrict({ allow }), tools.guard(() => {
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
     })]
