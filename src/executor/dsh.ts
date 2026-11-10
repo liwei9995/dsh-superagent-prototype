@@ -258,6 +258,15 @@ export class DshExecutor implements Executor {
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
       })
     await mkdir(directory, { recursive: true })
+    const gitFile = join(directory, '.git')
+    const isWorktree = await stat(gitFile).then(s => s.isFile()).catch(() => false)
+    if (isWorktree) {
+      const email = env.DSH_SUPERAGENT_CNB_COMMIT_EMAIL || env.DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL
+      const author = env.DSH_SUPERAGENT_CNB_ACCOUNT ? 'dots' : (env.DSH_SUPERAGENT_GITHUB_ACCOUNT || 'dots')
+      await runAsWorker(this.host.context.subprocess, ['git', 'config', 'extensions.worktreeConfig', 'true'], directory, signal).catch(() => {})
+      if (author) await runAsWorker(this.host.context.subprocess, ['git', 'config', '--worktree', 'user.name', author], directory, signal).catch(() => {})
+      if (email) await runAsWorker(this.host.context.subprocess, ['git', 'config', '--worktree', 'user.email', email], directory, signal).catch(() => {})
+    }
     await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */

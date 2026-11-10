@@ -11,4 +11,4 @@ Answer and resolve review threads as the Communication section says. To reply in
 
 The host delivers subscribed PR comments, reviews and CI directly to the bound worker. Immediately after creating or adopting a ticket PR, call `orchestrator_report` with `state: progress` and `pr_number`; do not wait for CI or handoff. Read each original trigger and acknowledge new human requests before substantial work. Worker reports still go to the orchestrator for concise source-conversation delivery.
 
-CNB Issue and Pull numbers are separate sequences. Thread keys are `cnb:issues/<n>` and `cnb:pulls/<n>`. Clone and push with HTTPS against `https://cnb.cool/<repo>.git`; git credentials come from the worker shim's `cnb git-credential` helper.
+CNB Issue and Pull numbers are separate sequences. Thread keys are `cnb:issues/<n>` and `cnb:pulls/<n>`. Clone and push with HTTPS against `https://cnb.cool/<repo>.git`; git credentials come from the worker shim's `cnb git-credential` helper. When committing, commit as author and committer `dots <$DSH_SUPERAGENT_CNB_COMMIT_EMAIL>`; do not run `git config` without `--worktree` or alter shared repository configuration.
